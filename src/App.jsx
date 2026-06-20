@@ -18,19 +18,13 @@ import {
 
 const AUDIO_SR = 44_100;
 const OVERSAMPLE = 8;
-const SIM_SR = AUDIO_SR * OVERSAMPLE; // 352.8 kHz: analoges S&H wird feiner gerastert
-const N = 131_072;                    // ca. 0.372 s, FFT-Auflösung ca. 2.69 Hz
+const SIM_SR = AUDIO_SR * OVERSAMPLE;
+const N = 131_072;
 const MAX_ANALYSIS_F = 120_000;
-const MIN_SPECTRUM_F = 500;
-const SPEC_LOG_LO = Math.log10(MIN_SPECTRUM_F);
-const SPEC_LOG_HI = Math.log10(MAX_ANALYSIS_F);
+const MIN_LOG_F = 10;
 const LOG_LO = Math.log10(300);
 const LOG_HI = Math.log10(AUDIO_SR);
 const EPS = 1e-12;
-
-// ════════════════════════════════════════
-// FFT
-// ════════════════════════════════════════
 function fftInPlace(re, im) {
   const n = re.length;
 
@@ -87,7 +81,12 @@ function computeSpectrum(sig) {
   let windowSum = 0;
 
   for (let i = 0; i < n; i += 1) {
-    const w = 0.5 * (1 - Math.cos((2 * Math.PI * i) / (n - 1)));
+    const phase = (2 * Math.PI * i) / (n - 1);
+    const w =
+      0.35875 -
+      0.48829 * Math.cos(phase) +
+      0.14128 * Math.cos(2 * phase) -
+      0.01168 * Math.cos(3 * phase);
     re[i] = sig[i] * w;
     windowSum += w;
   }
@@ -106,37 +105,56 @@ function computeSpectrum(sig) {
 
 const dB = (value) => 20 * Math.log10(Math.max(Math.abs(value), 1e-9));
 
-/**
- * Peak-erhaltendes Pooling:
- * Pro Darstellungsblock wird für jede Kurve das stärkste FFT-Bin behalten.
- * Anders als "i += 12" gehen schmale Peaks dadurch nicht verloren.
- */
-function buildSpectrumRows(spectra, sr, maxF, targetBuckets = 1800) {
+function buildSpectrumRows(
+  spectra,
+  sr,
+  minF,
+  maxF,
+  targetBuckets = 1800,
+  scaleType = "linear",
+) {
   const fftSize = spectra[0].mag.length * 2;
   const hzPerBin = sr / fftSize;
+  const minBin = Math.max(1, Math.floor(Math.max(0, minF) / hzPerBin));
   const maxBin = Math.min(
     spectra[0].mag.length - 1,
-    Math.max(2, Math.floor(maxF / hzPerBin)),
+    Math.max(minBin + 1, Math.ceil(maxF / hzPerBin)),
   );
-  const binsPerBucket = Math.max(1, Math.ceil(maxBin / targetBuckets));
-  const selectedBins = new Set([1, maxBin]);
+  const selectedBins = new Set([minBin, maxBin]);
 
-  for (let start = 1; start <= maxBin; start += binsPerBucket) {
-    const end = Math.min(maxBin + 1, start + binsPerBucket);
+  const addBucket = (start, end) => {
+    const first = Math.max(minBin, Math.min(maxBin, start));
+    const last = Math.max(first + 1, Math.min(maxBin + 1, end));
+    let bestBin = first;
+    let bestValue = -Infinity;
 
-    for (const spectrum of spectra) {
-      let bestBin = start;
-      let bestValue = -Infinity;
-
-      for (let bin = start; bin < end; bin += 1) {
-        const value = spectrum.mag[bin];
-        if (value > bestValue) {
-          bestValue = value;
-          bestBin = bin;
-        }
+    for (let bin = first; bin < last; bin += 1) {
+      let value = 0;
+      for (const spectrum of spectra) value = Math.max(value, spectrum.mag[bin]);
+      if (value > bestValue) {
+        bestValue = value;
+        bestBin = bin;
       }
+    }
 
-      selectedBins.add(bestBin);
+    selectedBins.add(bestBin);
+  };
+
+  if (scaleType === "log") {
+    const low = Math.max(hzPerBin, minF || hzPerBin);
+    const high = Math.max(low + hzPerBin, maxF);
+    const logLow = Math.log10(low);
+    const logHigh = Math.log10(high);
+
+    for (let bucket = 0; bucket < targetBuckets; bucket += 1) {
+      const startF = 10 ** (logLow + ((logHigh - logLow) * bucket) / targetBuckets);
+      const endF = 10 ** (logLow + ((logHigh - logLow) * (bucket + 1)) / targetBuckets);
+      addBucket(Math.floor(startF / hzPerBin), Math.ceil(endF / hzPerBin));
+    }
+  } else {
+    const binsPerBucket = Math.max(1, Math.ceil((maxBin - minBin + 1) / targetBuckets));
+    for (let start = minBin; start <= maxBin; start += binsPerBucket) {
+      addBucket(start, start + binsPerBucket);
     }
   }
 
@@ -150,10 +168,6 @@ function buildSpectrumRows(spectra, sr, maxF, targetBuckets = 1800) {
       return row;
     });
 }
-
-// ════════════════════════════════════════
-// OSZILLATOR
-// ════════════════════════════════════════
 function positiveModulo(value, modulus) {
   return ((value % modulus) + modulus) % modulus;
 }
@@ -174,11 +188,7 @@ function polyBlep(phase, phaseStep) {
   return 0;
 }
 
-/**
- * Analytisch auswertbarer Oszillator.
- * Rechteck und Sägezahn verwenden PolyBLEP, damit der Eingang nicht schon
- * massiv durch die Simulations-Abtastrate aliasiert.
- */
+
 function waveAt(type, frequency, amplitude, time, renderSampleRate = SIM_SR) {
   const phase = positiveModulo(frequency * time, 1);
   const phaseStep = Math.min(0.499, frequency / renderSampleRate);
@@ -199,8 +209,6 @@ function waveAt(type, frequency, amplitude, time, renderSampleRate = SIM_SR) {
     value -= polyBlep(phase, phaseStep);
     return amplitude * value;
   }
-
-  // Dreieck ist bereits kontinuierlich; seine Obertöne fallen mit 1/k².
   return amplitude * (1 - 4 * Math.abs(phase - 0.5));
 }
 
@@ -212,15 +220,6 @@ function renderInput(type, frequency, amplitude, length, sampleRate) {
   return out;
 }
 
-// ════════════════════════════════════════
-// SAMPLE-AND-HOLD
-// ════════════════════════════════════════
-/**
- * Rendert den kontinuierlich gedachten S&H-Ausgang auf dem hochauflösenden
- * SIM_SR-Raster. Die Samplewerte werden an den exakten Zeitpunkten n/fs aus
- * dem analytischen Oszillator berechnet. Dadurch hängt die Tonhöhe nicht von
- * ganzzahligen Perioden in Simulationssamples ab.
- */
 function renderSaH({
   type,
   frequency,
@@ -259,7 +258,6 @@ function renderSaH({
     }
 
     if (apertureTime > 0 && time < holdStart) {
-      // Track-Phase: Schalter ist geschlossen.
       out[i] = waveAt(
         type,
         frequency,
@@ -280,10 +278,6 @@ function renderSaH({
 
   return out;
 }
-
-// ════════════════════════════════════════
-// LOW-PASS FILTERS
-// ════════════════════════════════════════
 function rcLP(inp, sampleRate, cutoff) {
   const a = (2 * Math.PI * cutoff) / (2 * Math.PI * cutoff + sampleRate);
   const out = new Float32Array(inp.length);
@@ -354,8 +348,6 @@ function idealLP(inp, sampleRate, cutoff) {
     re[i] = 0;
     im[i] = 0;
   }
-
-  // IFFT via Konjugation
   for (let i = 0; i < n; i += 1) im[i] = -im[i];
   fftInPlace(re, im);
 
@@ -375,11 +367,7 @@ function applyLPF(inp, sampleRate, type, cutoff) {
   return inp.slice();
 }
 
-/**
- * Browser-Audio läuft typischerweise mit 44.1/48 kHz. Vor der 8:1-
- * Dezimation werden daher nur die nicht darstellbaren Ultraschallbilder
- * entfernt; bereits ins Audioband gefaltete Aliasanteile bleiben erhalten.
- */
+
 function makeAudioPreview(inp) {
   const filtered = bw8LP(inp, SIM_SR, 20_000);
   const outLength = Math.floor(filtered.length / OVERSAMPLE);
@@ -387,10 +375,6 @@ function makeAudioPreview(inp) {
   for (let i = 0; i < outLength; i += 1) out[i] = filtered[i * OVERSAMPLE];
   return out;
 }
-
-// ════════════════════════════════════════
-// TRANSFER FUNCTIONS
-// ════════════════════════════════════════
 function zohTF(frequency, holdSampleRate) {
   if (!frequency) return 1;
   const x = (Math.PI * frequency) / holdSampleRate;
@@ -411,10 +395,6 @@ function lpfTF(frequency, type, cutoff) {
   if (type === "ideal") return u <= 1 ? 1 : 1e-9;
   return 1;
 }
-
-// ════════════════════════════════════════
-// PEAK-/ALIAS-ANALYSE
-// ════════════════════════════════════════
 const TYPE_ORDER = { fund: 0, harm: 1, alias: 2, zoh: 3 };
 
 function foldToNyquist(frequency, sampleRate) {
@@ -513,10 +493,6 @@ function getFirstAliasingHarmonic(type, f0, holdSampleRate) {
 
   return null;
 }
-
-// ════════════════════════════════════════
-// UI
-// ════════════════════════════════════════
 const MO = { fontFamily: "var(--font-mono)" };
 const GR = "var(--color-border-tertiary)";
 const AX = "var(--color-text-secondary)";
@@ -534,8 +510,8 @@ function Slider({
   return (
     <div style={{ marginBottom: 10 }}>
       <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 3 }}>
-        <span style={{ fontSize: 13, color: AX, ...MO }}>{label}</span>
-        <span style={{ fontSize: 14, fontWeight: 600, color: "var(--color-text-primary)", ...MO }}>
+        <span style={{ fontSize: 16, color: AX, ...MO }}>{label}</span>
+        <span style={{ fontSize: 16, fontWeight: 600, color: "var(--color-text-primary)", ...MO }}>
           {step < 1 ? Number(value).toFixed(2) : value}
           {unit}
         </span>
@@ -568,8 +544,8 @@ function Panel({ title, accent = "var(--color-text-secondary)", children }) {
     >
       <div
         style={{
-          padding: "6px 12px",
-          fontSize: 12,
+          padding: "9px 14px",
+          fontSize: 16,
           fontWeight: 600,
           color: accent,
           background: "var(--color-background-secondary)",
@@ -581,7 +557,7 @@ function Panel({ title, accent = "var(--color-text-secondary)", children }) {
       >
         {title}
       </div>
-      <div style={{ padding: "12px 12px" }}>{children}</div>
+      <div style={{ padding: "14px" }}>{children}</div>
     </div>
   );
 }
@@ -594,7 +570,7 @@ function ChkBox({ label, checked, onChange, color = "#60a5fa", note }) {
           display: "flex",
           alignItems: "center",
           gap: 6,
-          fontSize: 13,
+          fontSize: 16,
           cursor: "pointer",
           color: "var(--color-text-primary)",
           ...MO,
@@ -609,7 +585,7 @@ function ChkBox({ label, checked, onChange, color = "#60a5fa", note }) {
         {label}
       </label>
       {note && (
-        <div style={{ fontSize: 12, color: AX, marginTop: 3, marginLeft: 20, lineHeight: 1.55 }}>
+        <div style={{ fontSize: 16, color: AX, marginTop: 3, marginLeft: 20, lineHeight: 1.55 }}>
           {note}
         </div>
       )}
@@ -627,7 +603,7 @@ function TipBox({ active, payload, label, fmtLabel = (v) => v, fmtVal = (v) => v
         border: "0.5px solid var(--color-border-secondary)",
         borderRadius: 6,
         padding: "6px 10px",
-        fontSize: 13,
+        fontSize: 16,
         ...MO,
       }}
     >
@@ -648,7 +624,7 @@ function TabBtn({ active, onClick, children }) {
       onClick={onClick}
       style={{
         padding: "10px 16px",
-        fontSize: 14,
+        fontSize: 16,
         cursor: "pointer",
         border: "none",
         background: active ? "var(--color-background-primary)" : "transparent",
@@ -670,10 +646,6 @@ const FILT = {
   bw8: "Butterworth 8. Ordnung (−48 dB/Okt)",
   ideal: "Idealfilter / Brickwall (Referenz)",
 };
-
-// ════════════════════════════════════════
-// APP
-// ════════════════════════════════════════
 export default function SaHSimulator() {
   const [wtype, setWtype] = useState("sin");
   const [freq, setFreq] = useState(440);
@@ -692,7 +664,9 @@ export default function SaHSimulator() {
   const [inPlay, setInPlay] = useState(false);
   const [outPlay, setOutPlay] = useState(false);
   const [showSaH, setShowSaH] = useState(true);
+  const [specMin, setSpecMin] = useState(0);
   const [specMax, setSpecMax] = useState(60_000);
+  const [specScale, setSpecScale] = useState("linear");
 
   const audioCtxRef = useRef(null);
   const playersRef = useRef({ input: null, output: null });
@@ -707,13 +681,11 @@ export default function SaHSimulator() {
       try {
         player.source.stop();
       } catch (_) {
-        // Bereits gestoppt.
       }
       try {
         player.source.disconnect();
         player.gain.disconnect();
       } catch (_) {
-        // Bereits getrennt.
       }
       playersRef.current[key] = null;
     }
@@ -807,8 +779,6 @@ export default function SaHSimulator() {
     const output = lpfOn ? applyLPF(sah, SIM_SR, lpfType, lpfCut) : sah.slice();
     return { inSig: input, sahSig: sah, outSig: output };
   }, [wtype, freq, amp, fs, droopOn, droopTau, aperOn, aperPct, lpfOn, lpfType, lpfCut]);
-
-  // Alte AudioBuffer nicht weiter loopen lassen, wenn sich die Simulation ändert.
   useEffect(() => {
     stopAllPlayers();
   }, [inSig, outSig, stopAllPlayers]);
@@ -857,10 +827,19 @@ export default function SaHSimulator() {
     ];
 
     return {
-      specComb: buildSpectrumRows(spectra, SIM_SR, specMax, 2200),
-      pkList: computePeaks(wtype, freq, fs, specMax),
+      specComb: buildSpectrumRows(
+        spectra,
+        SIM_SR,
+        specMin,
+        specMax,
+        2400,
+        specScale,
+      ),
+      pkList: computePeaks(wtype, freq, fs, specMax).filter(
+        (peak) => peak.f >= specMin,
+      ),
     };
-  }, [spectrumMagnitudes, wtype, freq, fs, showSaH, specMax]);
+  }, [spectrumMagnitudes, wtype, freq, fs, showSaH, specMin, specMax, specScale]);
 
   const tfData = useMemo(() => {
     if (tab !== "tf") return [];
@@ -899,17 +878,31 @@ export default function SaHSimulator() {
     setFsText(String(hz));
   };
 
-  const setSpectrumMax = (value) => {
-    const clamped = Math.max(
-      MIN_SPECTRUM_F,
-      Math.min(MAX_ANALYSIS_F, Math.round(value)),
-    );
-    setSpecMax(clamped);
+  const setSpectrumRange = (minimum, maximum) => {
+    const safeMax = Math.max(20, Math.min(MAX_ANALYSIS_F, Number(maximum) || 20));
+    const safeMin = Math.max(0, Math.min(safeMax - 1, Number(minimum) || 0));
+    setSpecMin(safeMin);
+    setSpecMax(safeMax);
+  };
+
+  const zoomSpectrum = (factor) => {
+    if (specScale === "log") {
+      const low = Math.max(MIN_LOG_F, specMin || MIN_LOG_F);
+      const high = Math.max(low + 1, specMax);
+      const center = Math.sqrt(low * high);
+      const ratio = Math.sqrt(high / low) ** factor;
+      setSpectrumRange(center / ratio, center * ratio);
+      return;
+    }
+
+    const center = (specMin + specMax) / 2;
+    const halfWidth = Math.max(10, ((specMax - specMin) * factor) / 2);
+    setSpectrumRange(center - halfWidth, center + halfWidth);
   };
 
   const zoomToFundamental = () => {
     const target = Math.max(1_000, Math.ceil((freq * 12) / 500) * 500);
-    setSpectrumMax(target);
+    setSpectrumRange(specScale === "log" ? MIN_LOG_F : 0, target);
   };
 
   const handleFsText = (event) => {
@@ -925,17 +918,16 @@ export default function SaHSimulator() {
     border: "0.5px solid var(--color-border-secondary)",
     borderRadius: 6,
     color: "var(--color-text-primary)",
-    padding: "5px 8px",
-    fontSize: 13,
+    padding: "7px 10px",
+    fontSize: 16,
     width: "100%",
     cursor: "pointer",
     ...MO,
   };
-  const tick13 = { fontSize: 15, ...MO };
-  const tick12 = { fontSize: 14, ...MO };
+  const chartTick = { fontSize: 16, ...MO };
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", height: "100vh" }}>
+    <div style={{ display: "flex", flexDirection: "column", height: "100vh", fontSize: 16 }}>
       <div
         style={{
           background: "var(--color-background-secondary)",
@@ -947,10 +939,7 @@ export default function SaHSimulator() {
           flexWrap: "wrap",
         }}
       >
-        <span style={{ fontWeight: 600, fontSize: 18, ...MO }}>S&amp;H Simulator</span>
-        <span style={{ color: AX, fontSize: 13 }}>
-          intern {SIM_SR / 1000} kHz · exakte n/fs-Samplewerte · Hann-FFT
-        </span>
+        <span style={{ fontWeight: 600, fontSize: 20, ...MO }}>S&amp;H Simulator</span>
         {fundamentalAliasing && (
           <span
             style={{
@@ -958,7 +947,7 @@ export default function SaHSimulator() {
               background: "var(--color-background-danger)",
               border: "0.5px solid var(--color-border-danger)",
               color: "var(--color-text-danger)",
-              fontSize: 11,
+              fontSize: 16,
               padding: "2px 8px",
               borderRadius: 4,
               ...MO,
@@ -972,7 +961,7 @@ export default function SaHSimulator() {
       <div style={{ display: "flex", flex: 1, overflow: "hidden" }}>
         <div
           style={{
-            width: 314,
+            width: 350,
             flexShrink: 0,
             background: "var(--color-background-secondary)",
             borderRight: "0.5px solid var(--color-border-tertiary)",
@@ -994,8 +983,8 @@ export default function SaHSimulator() {
                   onClick={() => setWtype(value)}
                   style={{
                     flex: 1,
-                    fontSize: 11,
-                    padding: "5px 0",
+                    fontSize: 16,
+                    padding: "8px 4px",
                     borderRadius: 4,
                     cursor: "pointer",
                     ...MO,
@@ -1013,7 +1002,7 @@ export default function SaHSimulator() {
           </Panel>
 
           <Panel title="📡 Abtastung (S&H)" accent="#f97316">
-            <div style={{ fontSize: 13, color: AX, marginBottom: 5, ...MO }}>
+            <div style={{ fontSize: 16, color: AX, marginBottom: 5, ...MO }}>
               S&amp;H-Abtastrate (logarithmisch)
             </div>
             <div style={{ display: "flex", gap: 6, alignItems: "center", marginBottom: 6 }}>
@@ -1023,7 +1012,7 @@ export default function SaHSimulator() {
                 onBlur={() => setFsText(String(fs))}
                 style={{ ...selectStyle, width: 88, padding: "4px 6px" }}
               />
-              <span style={{ fontSize: 13, color: AX }}>Hz</span>
+              <span style={{ fontSize: 16, color: AX }}>Hz</span>
             </div>
             <input
               type="range"
@@ -1034,7 +1023,7 @@ export default function SaHSimulator() {
               onChange={(event) => setFsFromLog(event.target.value)}
               style={{ width: "100%", accentColor: "#f97316" }}
             />
-            <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, color: AX, marginTop: 3, ...MO }}>
+            <div style={{ display: "flex", justifyContent: "space-between", fontSize: 16, color: AX, marginTop: 3, ...MO }}>
               {[
                 "300",
                 "1k",
@@ -1047,7 +1036,7 @@ export default function SaHSimulator() {
               style={{
                 padding: "3px 8px",
                 borderRadius: 4,
-                fontSize: 13,
+                fontSize: 16,
                 marginTop: 7,
                 ...MO,
                 background: fundamentalAliasing ? "var(--color-background-danger)" : "var(--color-background-success)",
@@ -1058,7 +1047,7 @@ export default function SaHSimulator() {
               Grundton: Nyquist {nyquist.toFixed(0)} Hz {fundamentalAliasing ? "→ Alias" : "✓"}
             </div>
             {firstAliasedHarmonic && !fundamentalAliasing && (
-              <div style={{ fontSize: 12, color: "#fbbf24", marginTop: 5, lineHeight: 1.45, ...MO }}>
+              <div style={{ fontSize: 16, color: "#fbbf24", marginTop: 5, lineHeight: 1.45, ...MO }}>
                 Erste gefaltete Quellharmonische: {firstAliasedHarmonic.k}f₀={Math.round(firstAliasedHarmonic.frequency)} Hz → {Math.round(firstAliasedHarmonic.alias)} Hz
               </div>
             )}
@@ -1086,11 +1075,6 @@ export default function SaHSimulator() {
                   onChange={setLpfCut}
                   accent="#4ade80"
                 />
-                <div style={{ fontSize: 12, color: AX, ...MO, lineHeight: 1.6, marginTop: 2 }}>
-                  {lpfType === "ideal" && "FFT-Maske mit periodischer Blockannahme. Kanten-Ringing ist deshalb teilweise Blockartefakt."}
-                  {lpfType === "bw8" && "Vier Biquad-Stufen; hohe Dämpfung der ZOH-Bilder."}
-                  {lpfType === "rc1" && "Ein Pol; weit entfernte Bilder werden nur schwach gedämpft."}
-                </div>
               </>
             )}
           </Panel>
@@ -1106,7 +1090,7 @@ export default function SaHSimulator() {
                 padding: "7px 12px",
                 background: "var(--color-background-secondary)",
                 color: AX,
-                fontSize: 12,
+                fontSize: 16,
                 border: "none",
                 cursor: "pointer",
                 ...MO,
@@ -1125,7 +1109,6 @@ export default function SaHSimulator() {
                   checked={droopOn}
                   onChange={setDroopOn}
                   color="#fbbf24"
-                  note="Exponentieller Abfall erst während der Hold-Phase"
                 />
                 {droopOn && (
                   <Slider
@@ -1143,7 +1126,6 @@ export default function SaHSimulator() {
                   checked={aperOn}
                   onChange={setAperOn}
                   color="#fbbf24"
-                  note="Während des Pulses folgt der Ausgang dem Eingang; danach wird gehalten"
                 />
                 {aperOn && (
                   <Slider
@@ -1160,84 +1142,6 @@ export default function SaHSimulator() {
             )}
           </div>
 
-          <Panel title="📊 Analyse / Spektrum-Zoom">
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 6, ...MO }}>
-              <span style={{ fontSize: 12, color: AX }}>X-Achse bis</span>
-              <strong style={{ fontSize: 14, color: "var(--color-text-primary)" }}>
-                {specMax >= 1000 ? `${(specMax / 1000).toFixed(specMax < 10_000 ? 1 : 0)} kHz` : `${specMax} Hz`}
-              </strong>
-            </div>
-            <input
-              type="range"
-              min={SPEC_LOG_LO}
-              max={SPEC_LOG_HI}
-              step={0.002}
-              value={Math.log10(specMax)}
-              onChange={(event) => setSpectrumMax(10 ** Number.parseFloat(event.target.value))}
-              style={{ width: "100%", accentColor: "#a78bfa", marginBottom: 7 }}
-            />
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 4, marginBottom: 8 }}>
-              {[2_000, 5_000, 10_000, 20_000, 60_000, 120_000].map((value) => (
-                <button
-                  type="button"
-                  key={value}
-                  onClick={() => setSpectrumMax(value)}
-                  style={{
-                    fontSize: 12,
-                    padding: "5px 3px",
-                    borderRadius: 4,
-                    cursor: "pointer",
-                    border: `0.5px solid ${specMax === value ? "#a78bfa" : "var(--color-border-tertiary)"}`,
-                    background: specMax === value ? "#6d28d920" : "var(--color-background-secondary)",
-                    color: specMax === value ? "#c4b5fd" : AX,
-                    ...MO,
-                  }}
-                >
-                  {value / 1000} kHz
-                </button>
-              ))}
-            </div>
-            <button
-              type="button"
-              onClick={zoomToFundamental}
-              style={{
-                width: "100%",
-                marginBottom: 6,
-                padding: "6px 6px",
-                borderRadius: 4,
-                cursor: "pointer",
-                border: "0.5px solid #a78bfa",
-                background: "#6d28d914",
-                color: "#c4b5fd",
-                fontSize: 12,
-                ...MO,
-              }}
-            >
-              Auf Grundton zoomen (≈ 12 × f₀)
-            </button>
-            <button
-              type="button"
-              onClick={() => setFreq(Math.max(50, Math.min(8_000, Math.round(freq / fftResolution) * fftResolution)))}
-              style={{
-                width: "100%",
-                marginBottom: 8,
-                padding: "6px 6px",
-                borderRadius: 4,
-                cursor: "pointer",
-                border: "0.5px solid var(--color-border-secondary)",
-                background: "var(--color-background-secondary)",
-                color: AX,
-                fontSize: 12,
-                ...MO,
-              }}
-            >
-              f₀ auf nächstes FFT-Bin rasten
-            </button>
-            <div style={{ fontSize: 12, color: AX, lineHeight: 1.6, ...MO }}>
-              FFT: N={N.toLocaleString("de-DE")}, Δf={fftResolution.toFixed(2)} Hz. Der Zoom berechnet die FFT nicht erneut.
-            </div>
-          </Panel>
-
           <Panel title="🔊 Audio">
             <div style={{ display: "flex", gap: 6, marginBottom: 8 }}>
               <button
@@ -1245,10 +1149,10 @@ export default function SaHSimulator() {
                 onClick={() => togglePlayer("input", inSig, inPlay)}
                 style={{
                   flex: 1,
-                  padding: "5px 4px",
+                  padding: "8px 6px",
                   borderRadius: 4,
                   cursor: "pointer",
-                  fontSize: 13,
+                  fontSize: 16,
                   ...MO,
                   border: `0.5px solid ${inPlay ? "#60a5fa" : "var(--color-border-secondary)"}`,
                   background: inPlay ? "#1d4ed820" : "var(--color-background-secondary)",
@@ -1262,10 +1166,10 @@ export default function SaHSimulator() {
                 onClick={() => togglePlayer("output", outSig, outPlay)}
                 style={{
                   flex: 1,
-                  padding: "5px 4px",
+                  padding: "8px 6px",
                   borderRadius: 4,
                   cursor: "pointer",
-                  fontSize: 13,
+                  fontSize: 16,
                   ...MO,
                   border: `0.5px solid ${outPlay ? "#4ade80" : "var(--color-border-secondary)"}`,
                   background: outPlay ? "#16a34a20" : "var(--color-background-secondary)",
@@ -1276,9 +1180,6 @@ export default function SaHSimulator() {
               </button>
             </div>
             <ChkBox label="S&H-Signal anzeigen" checked={showSaH} onChange={setShowSaH} color="#f97316" />
-            <div style={{ fontSize: 12, color: AX, lineHeight: 1.5 }}>
-              Ein gemeinsamer AudioContext wird wiederverwendet. Parameteränderungen stoppen alte Loop-Puffer sofort.
-            </div>
           </Panel>
         </div>
 
@@ -1298,7 +1199,7 @@ export default function SaHSimulator() {
           <div style={{ flex: 1, overflowY: "auto", padding: "18px 22px" }}>
             {tab === "time" && (
               <div>
-                <div style={{ display: "flex", gap: 16, marginBottom: 10, flexWrap: "wrap", fontSize: 14 }}>
+                <div style={{ display: "flex", gap: 16, marginBottom: 10, flexWrap: "wrap", fontSize: 16 }}>
                   <span style={{ color: "#60a5fa" }}>— Eingang</span>
                   {showSaH && <span style={{ color: "#f97316" }}>— S&amp;H / Track-and-Hold</span>}
                   <span style={{ color: "#4ade80" }}>— Filterausgang</span>
@@ -1310,17 +1211,17 @@ export default function SaHSimulator() {
                       <XAxis
                         dataKey="t"
                         stroke={AX}
-                        tick={tick13}
+                        tick={chartTick}
                         type="number"
                         domain={["dataMin", "dataMax"]}
                         tickFormatter={(value) => Number(value).toFixed(2)}
-                        label={{ value: "Zeit (ms)", position: "insideBottomRight", dy: 18, fontSize: 15, fill: AX }}
+                        label={{ value: "Zeit (ms)", position: "insideBottomRight", dy: 18, fontSize: 16, fill: AX }}
                       />
                       <YAxis
                         stroke={AX}
-                        tick={tick13}
+                        tick={chartTick}
                         domain={[-1.3, 1.3]}
-                        label={{ value: "Amplitude", angle: -90, position: "insideLeft", dx: -10, fontSize: 14, fill: AX }}
+                        label={{ value: "Amplitude", angle: -90, position: "insideLeft", dx: -10, fontSize: 16, fill: AX }}
                       />
                       <Tooltip content={<TipBox fmtLabel={(value) => `${Number(value).toFixed(3)} ms`} fmtVal={(value) => Number(value).toFixed(5)} />} />
                       <Line isAnimationActive={false} type="linear" dataKey="Eingang" stroke="#60a5fa" dot={false} strokeWidth={1.4} />
@@ -1329,8 +1230,8 @@ export default function SaHSimulator() {
                     </LineChart>
                   </ResponsiveContainer>
                 </div>
-                <div style={{ marginTop: 11, fontSize: 13, color: AX, lineHeight: 1.8, ...MO }}>
-                  fs={fs} Hz → Tₛ={(1000 / fs).toFixed(4)} ms. Internes Raster: {(1000 / SIM_SR).toFixed(5)} ms.
+                <div style={{ marginTop: 11, fontSize: 16, color: AX, lineHeight: 1.8, ...MO }}>
+                  fs={fs} Hz → Tₛ={(1000 / fs).toFixed(4)} ms.
                   {droopOn && ` Droop τ=${droopTau} ms.`}
                   {aperOn && ` Track ${aperPct} %.`}
                   {lpfOn && ` Filter: ${FILT[lpfType]} bei fc=${lpfCut} Hz.`}
@@ -1340,7 +1241,88 @@ export default function SaHSimulator() {
 
             {tab === "spec" && (
               <div>
-                <div style={{ display: "flex", gap: 10, marginBottom: 8, flexWrap: "wrap", fontSize: 14 }}>
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "end",
+                    gap: 10,
+                    flexWrap: "wrap",
+                    marginBottom: 14,
+                    padding: 12,
+                    background: "var(--color-background-secondary)",
+                    border: "0.5px solid var(--color-border-tertiary)",
+                    borderRadius: 8,
+                  }}
+                >
+                  <label style={{ display: "grid", gap: 4, minWidth: 130, color: AX, ...MO }}>
+                    Von (Hz)
+                    <input
+                      type="number"
+                      min={0}
+                      max={Math.max(0, specMax - 1)}
+                      step={1}
+                      value={Math.round(specMin)}
+                      onChange={(event) => setSpectrumRange(event.target.value, specMax)}
+                      style={{ ...selectStyle, width: 130 }}
+                    />
+                  </label>
+                  <label style={{ display: "grid", gap: 4, minWidth: 140, color: AX, ...MO }}>
+                    Bis (Hz)
+                    <input
+                      type="number"
+                      min={20}
+                      max={MAX_ANALYSIS_F}
+                      step={10}
+                      value={Math.round(specMax)}
+                      onChange={(event) => setSpectrumRange(specMin, event.target.value)}
+                      style={{ ...selectStyle, width: 140 }}
+                    />
+                  </label>
+                  <label style={{ display: "grid", gap: 4, minWidth: 150, color: AX, ...MO }}>
+                    Skalierung
+                    <select
+                      value={specScale}
+                      onChange={(event) => {
+                        const next = event.target.value;
+                        setSpecScale(next);
+                        if (next === "log" && specMin < MIN_LOG_F) setSpecMin(MIN_LOG_F);
+                      }}
+                      style={{ ...selectStyle, width: 150 }}
+                    >
+                      <option value="linear">Linear</option>
+                      <option value="log">Logarithmisch</option>
+                    </select>
+                  </label>
+                  <button type="button" onClick={() => zoomSpectrum(0.5)} style={{ ...selectStyle, width: "auto", minWidth: 54 }}>+</button>
+                  <button type="button" onClick={() => zoomSpectrum(2)} style={{ ...selectStyle, width: "auto", minWidth: 54 }}>−</button>
+                  <button type="button" onClick={zoomToFundamental} style={{ ...selectStyle, width: "auto" }}>Grundton</button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const nextFreq = Math.max(50, Math.min(8_000, Math.round(freq / fftResolution) * fftResolution));
+                      const nextFs = Math.max(300, Math.min(AUDIO_SR, Math.round(fs / fftResolution) * fftResolution));
+                      setFreq(nextFreq);
+                      setFs(nextFs);
+                      setFsText(nextFs.toFixed(2));
+                    }}
+                    style={{ ...selectStyle, width: "auto" }}
+                  >
+                    FFT-Raster
+                  </button>
+                  <div style={{ display: "flex", gap: 5, flexWrap: "wrap", flexBasis: "100%" }}>
+                    {[1_000, 2_000, 5_000, 10_000, 20_000, 40_000, 60_000, 120_000].map((value) => (
+                      <button
+                        type="button"
+                        key={value}
+                        onClick={() => setSpectrumRange(specScale === "log" ? MIN_LOG_F : 0, value)}
+                        style={{ ...selectStyle, width: "auto", padding: "6px 10px" }}
+                      >
+                        {value / 1000} kHz
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                <div style={{ display: "flex", gap: 10, marginBottom: 8, flexWrap: "wrap", fontSize: 16 }}>
                   <span style={{ color: "#60a5fa" }}>— Eingang</span>
                   {showSaH && <span style={{ color: "#f97316" }}>— S&amp;H</span>}
                   <span style={{ color: "#4ade80" }}>— Ausgang</span>
@@ -1349,23 +1331,25 @@ export default function SaHSimulator() {
                   <span style={{ color: "#fbbf24" }}>│ S&amp;H-Nyquist</span>
                 </div>
                 <div style={{ background: "var(--color-background-secondary)", borderRadius: 8, border: "0.5px solid var(--color-border-tertiary)", paddingTop: 8 }}>
-                  <ResponsiveContainer width="100%" height={430}>
-                    <LineChart data={specComb} margin={{ top: 58, right: 28, bottom: 38, left: 72 }}>
+                  <ResponsiveContainer width="100%" height={500}>
+                    <LineChart data={specComb} margin={{ top: 82, right: 36, bottom: 46, left: 82 }}>
                       <CartesianGrid strokeDasharray="2 6" stroke={GR} />
                       <XAxis
                         dataKey="f"
                         stroke={AX}
-                        tick={tick13}
+                        tick={chartTick}
                         type="number"
-                        domain={[0, specMax]}
-                        tickFormatter={(value) => (value >= 1000 ? `${(value / 1000).toFixed(0)}k` : String(value))}
-                        label={{ value: "Frequenz (Hz)", position: "insideBottomRight", dy: 20, fontSize: 15, fill: AX }}
+                        scale={specScale === "log" ? "log" : "linear"}
+                        domain={[specScale === "log" ? Math.max(MIN_LOG_F, specMin) : specMin, specMax]}
+                        allowDataOverflow
+                        tickFormatter={(value) => (value >= 1000 ? `${(value / 1000).toFixed(value < 10_000 ? 1 : 0)}k` : String(Math.round(value)))}
+                        label={{ value: "Frequenz (Hz)", position: "insideBottomRight", dy: 20, fontSize: 16, fill: AX }}
                       />
                       <YAxis
                         stroke={AX}
-                        tick={tick13}
+                        tick={chartTick}
                         domain={[-120, 5]}
-                        label={{ value: "dBFS", angle: -90, position: "insideLeft", dx: -16, fontSize: 15, fill: AX }}
+                        label={{ value: "dBFS", angle: -90, position: "insideLeft", dx: -16, fontSize: 16, fill: AX }}
                       />
                       <Tooltip content={<TipBox fmtLabel={(value) => `${Number(value).toFixed(1)} Hz`} fmtVal={(value) => `${Number(value).toFixed(1)} dBFS`} />} />
 
@@ -1377,25 +1361,25 @@ export default function SaHSimulator() {
                           strokeDasharray={peak.type === "alias" ? "3 2" : "4 3"}
                           strokeOpacity={0.82}
                           strokeWidth={1.25}
-                          label={{ value: peak.label.slice(0, 18), position: "insideTopRight", fontSize: 11, fill: peak.color, angle: -55, dy: 18, dx: 4 }}
+                          label={{ value: peak.label.slice(0, 18), position: "insideTopRight", fontSize: 14, fill: peak.color, angle: -50, dy: 30, dx: 6 }}
                         />
                       ))}
-                      {nyquist <= specMax && (
+                      {nyquist >= specMin && nyquist <= specMax && (
                         <ReferenceLine
                           x={nyquist}
                           stroke="#fbbf24"
                           strokeWidth={1.5}
                           strokeDasharray="6 2"
-                          label={{ value: `Nyquist ${nyquist} Hz`, position: "insideTopRight", fontSize: 12, fill: "#fbbf24", dy: 6, ...MO }}
+                          label={{ value: `Nyquist ${nyquist} Hz`, position: "insideTopRight", fontSize: 16, fill: "#fbbf24", dy: 6, ...MO }}
                         />
                       )}
-                      {lpfOn && lpfCut <= specMax && (
+                      {lpfOn && lpfCut >= specMin && lpfCut <= specMax && (
                         <ReferenceLine
                           x={lpfCut}
                           stroke="#4ade80"
                           strokeWidth={1}
                           strokeDasharray="4 3"
-                          label={{ value: `fc=${lpfCut} Hz`, position: "insideTopRight", fontSize: 12, fill: "#4ade80", dy: 6, ...MO }}
+                          label={{ value: `fc=${lpfCut} Hz`, position: "insideTopRight", fontSize: 16, fill: "#4ade80", dy: 6, ...MO }}
                         />
                       )}
 
@@ -1405,10 +1389,7 @@ export default function SaHSimulator() {
                     </LineChart>
                   </ResponsiveContainer>
                 </div>
-                <div style={{ marginTop: 10, fontSize: 13, color: AX, lineHeight: 1.65, ...MO }}>
-                  Die sichtbaren „Bäuche“ unmittelbar um Linien sind die Hann-Hauptkeule. Die Kurven werden peak-erhaltend gepoolt; schmale Peaks werden nicht mehr durch das Überspringen von FFT-Bins verschluckt.
-                </div>
-                <div style={{ marginTop: 9, fontSize: 13, lineHeight: 1.85, ...MO }}>
+                <div style={{ marginTop: 9, fontSize: 16, lineHeight: 1.85, ...MO }}>
                   <span style={{ color: "var(--color-text-primary)", fontWeight: 500 }}>Komponenten: </span>
                   {pkList.slice(0, 28).map((peak) => (
                     <span key={`${peak.type}-${peak.f}-${peak.label}`} style={{ color: peak.color, marginRight: 10 }}>
@@ -1421,7 +1402,7 @@ export default function SaHSimulator() {
 
             {tab === "tf" && (
               <div>
-                <div style={{ display: "flex", gap: 14, marginBottom: 8, flexWrap: "wrap", fontSize: 14 }}>
+                <div style={{ display: "flex", gap: 14, marginBottom: 8, flexWrap: "wrap", fontSize: 16 }}>
                   <span style={{ color: "#f97316" }}>— ZOH-Sinc</span>
                   <span style={{ color: "#4ade80" }}>— Tiefpass</span>
                   <span style={{ color: "#60a5fa" }}>— Gesamt</span>
@@ -1433,32 +1414,29 @@ export default function SaHSimulator() {
                       <XAxis
                         dataKey="f"
                         stroke={AX}
-                        tick={tick12}
+                        tick={chartTick}
                         type="number"
                         domain={["dataMin", "dataMax"]}
                         tickFormatter={(value) => (value >= 1000 ? `${(value / 1000).toFixed(0)}k` : String(value))}
-                        label={{ value: "Frequenz (Hz)", position: "insideBottomRight", dy: 18, fontSize: 15, fill: AX }}
+                        label={{ value: "Frequenz (Hz)", position: "insideBottomRight", dy: 18, fontSize: 16, fill: AX }}
                       />
                       <YAxis
                         stroke={AX}
-                        tick={tick12}
+                        tick={chartTick}
                         domain={[-100, 5]}
-                        label={{ value: "dB", angle: -90, position: "insideLeft", dx: -14, fontSize: 15, fill: AX }}
+                        label={{ value: "dB", angle: -90, position: "insideLeft", dx: -14, fontSize: 16, fill: AX }}
                       />
                       <Tooltip content={<TipBox fmtLabel={(value) => `${Number(value).toFixed(0)} Hz`} fmtVal={(value) => `${Number(value).toFixed(1)} dB`} />} />
                       <ReferenceLine y={-3.92} stroke="#f97316" strokeDasharray="2 4" strokeOpacity={0.5} />
-                      <ReferenceLine x={nyquist} stroke="#fbbf24" strokeWidth={1.3} strokeDasharray="6 2" label={{ value: "Nyquist", position: "insideTopRight", fontSize: 12, fill: "#fbbf24", dy: 6 }} />
-                      <ReferenceLine x={fs} stroke={AX} strokeDasharray="3 3" label={{ value: "fs", position: "insideTopRight", fontSize: 12, fill: AX, dy: 6 }} />
-                      {lpfOn && <ReferenceLine x={lpfCut} stroke="#4ade80" strokeDasharray="4 3" label={{ value: "fc", position: "insideTopRight", fontSize: 12, fill: "#4ade80", dy: 6 }} />}
-                      <ReferenceLine x={freq} stroke="#60a5fa" strokeDasharray="2 4" label={{ value: "f₀", position: "insideTopRight", fontSize: 12, fill: "#60a5fa", dy: 6 }} />
+                      <ReferenceLine x={nyquist} stroke="#fbbf24" strokeWidth={1.3} strokeDasharray="6 2" label={{ value: "Nyquist", position: "insideTopRight", fontSize: 16, fill: "#fbbf24", dy: 6 }} />
+                      <ReferenceLine x={fs} stroke={AX} strokeDasharray="3 3" label={{ value: "fs", position: "insideTopRight", fontSize: 16, fill: AX, dy: 6 }} />
+                      {lpfOn && <ReferenceLine x={lpfCut} stroke="#4ade80" strokeDasharray="4 3" label={{ value: "fc", position: "insideTopRight", fontSize: 16, fill: "#4ade80", dy: 6 }} />}
+                      <ReferenceLine x={freq} stroke="#60a5fa" strokeDasharray="2 4" label={{ value: "f₀", position: "insideTopRight", fontSize: 16, fill: "#60a5fa", dy: 6 }} />
                       <Line isAnimationActive={false} type="linear" dataKey="ZOH" stroke="#f97316" dot={false} strokeWidth={1.5} />
                       <Line isAnimationActive={false} type="linear" dataKey="LPF" stroke="#4ade80" dot={false} strokeWidth={1.5} />
                       <Line isAnimationActive={false} type="linear" dataKey="Gesamt" stroke="#60a5fa" dot={false} strokeWidth={2} />
                     </LineChart>
                   </ResponsiveContainer>
-                </div>
-                <div style={{ marginTop: 12, fontSize: 13, color: AX, lineHeight: 1.8, ...MO }}>
-                  ZOH: −3,92 dB bei fs/2 und Nullstellen bei n·fs. Der Graph zeigt den idealen Instant-Sample/ZOH-Fall; eine aktivierte Track-Zeit verändert den Zeitverlauf zusätzlich.
                 </div>
               </div>
             )}
@@ -1472,7 +1450,7 @@ export default function SaHSimulator() {
               display: "flex",
               flexWrap: "wrap",
               gap: 14,
-              fontSize: 12,
+              fontSize: 16,
               color: AX,
               ...MO,
             }}
@@ -1480,8 +1458,6 @@ export default function SaHSimulator() {
             <span style={{ color: "#f97316" }}>S&amp;H fs={fs} Hz</span>
             <span>Nyquist={nyquist} Hz</span>
             <span style={{ color: "#60a5fa" }}>f₀={freq} Hz</span>
-            <span>Simulation={SIM_SR / 1000} kHz</span>
-            <span>FFT Δf={fftResolution.toFixed(2)} Hz</span>
             {lpfOn && <span style={{ color: "#4ade80" }}>fc={lpfCut} Hz ({lpfType})</span>}
             {droopOn && <span style={{ color: "#fbbf24" }}>τ={droopTau} ms</span>}
             {aperOn && <span style={{ color: "#fbbf24" }}>Track={aperPct} %</span>}
