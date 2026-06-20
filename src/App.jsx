@@ -517,6 +517,295 @@ function computePeaks(type, f0, holdSampleRate, maxF) {
   return Array.from(seen.values()).sort((a, b) => a.f - b.f);
 }
 
+
+function harmonicCoefficient(type, harmonic, amplitude) {
+  if (harmonic < 1) return null;
+
+  if (type === "sin") {
+    return harmonic === 1 ? { re: 0, im: -amplitude / 2 } : null;
+  }
+
+  if (type === "sq") {
+    if (harmonic % 2 === 0) return null;
+    return { re: 0, im: (-2 * amplitude) / (Math.PI * harmonic) };
+  }
+
+  if (type === "saw") {
+    return { re: 0, im: amplitude / (Math.PI * harmonic) };
+  }
+
+  if (harmonic % 2 === 0) return null;
+  return {
+    re: (-4 * amplitude) / (Math.PI * Math.PI * harmonic * harmonic),
+    im: 0,
+  };
+}
+
+function addComplexComponent(map, frequency, re, im, harmonic, aliased) {
+  const key = Math.round(frequency * 1e6) / 1e6;
+  const magnitude = Math.hypot(re, im);
+  const current = map.get(key) || {
+    f: frequency,
+    re: 0,
+    im: 0,
+    dominantHarmonic: harmonic,
+    dominantMagnitude: -1,
+    hasAlias: false,
+    hasDirect: false,
+  };
+
+  current.re += re;
+  current.im += im;
+  current.hasAlias ||= aliased;
+  current.hasDirect ||= !aliased;
+
+  if (magnitude > current.dominantMagnitude) {
+    current.dominantMagnitude = magnitude;
+    current.dominantHarmonic = harmonic;
+  }
+
+  map.set(key, current);
+}
+
+function analyticalPeakLabel(component, isImage, imageIndex, side) {
+  const harmonic = component.dominantHarmonic;
+
+  if (isImage) {
+    const base = harmonic === 1 ? "f₀" : `${harmonic}f₀`;
+    return `ZOH ${imageIndex}·fs${side}${base}`;
+  }
+
+  if (component.hasAlias) {
+    return harmonic === 1 ? "Alias f₀" : `Alias ${harmonic}f₀`;
+  }
+
+  if (harmonic === 1) return "Grundton";
+  return `${harmonic}. Oberton`;
+}
+
+function buildSimplifiedSpectrum({
+  type,
+  f0,
+  amplitude,
+  holdSampleRate,
+  minF,
+  maxF,
+  scaleType,
+  showSaH,
+  lpfOn,
+  lpfType,
+  lpfCut,
+}) {
+  const sourceLimit = SIM_SR * 0.45;
+  const maxHarmonic = Math.min(8192, Math.floor(sourceLimit / f0));
+  const nyquist = holdSampleRate / 2;
+  const baseComponents = new Map();
+  const lines = new Map();
+
+  const addLine = (frequency, series, peakAmplitude, label, typeName, color) => {
+    if (!(frequency >= minF && frequency <= maxF) || peakAmplitude <= 0) return;
+    const dbValue = Math.max(SPECTRUM_FLOOR_DB, dB(peakAmplitude));
+    if (dbValue <= SPECTRUM_FLOOR_DB + 0.01) return;
+
+    const key = Math.round(frequency * 1e6) / 1e6;
+    const current = lines.get(key) || {
+      f: frequency,
+      Eingang: null,
+      "S&H": null,
+      Ausgang: null,
+      label,
+      type: typeName,
+      color,
+    };
+
+    if (current[series] == null || dbValue > current[series]) current[series] = dbValue;
+
+    if ((TYPE_ORDER[typeName] ?? 9) < (TYPE_ORDER[current.type] ?? 9)) {
+      current.label = label;
+      current.type = typeName;
+      current.color = color;
+    }
+
+    lines.set(key, current);
+  };
+
+  for (let harmonic = 1; harmonic <= maxHarmonic; harmonic += 1) {
+    const coefficient = harmonicCoefficient(type, harmonic, amplitude);
+    if (!coefficient) continue;
+
+    const harmonicFrequency = harmonic * f0;
+    const harmonicPeak = 2 * Math.hypot(coefficient.re, coefficient.im);
+
+    if (harmonicFrequency <= maxF) {
+      addLine(
+        harmonicFrequency,
+        "Eingang",
+        harmonicPeak,
+        harmonic === 1 ? "Grundton" : `${harmonic}. Oberton`,
+        harmonic === 1 ? "fund" : "harm",
+        harmonic === 1 ? "#60a5fa" : "#34d399",
+      );
+    }
+
+    const modulo = positiveModulo(harmonicFrequency, holdSampleRate);
+    const tolerance = Math.max(1e-9, holdSampleRate * 1e-10);
+    const aliased = harmonicFrequency > nyquist + tolerance;
+
+    if (modulo < tolerance || Math.abs(modulo - holdSampleRate) < tolerance) {
+      addComplexComponent(
+        baseComponents,
+        0,
+        2 * coefficient.re,
+        0,
+        harmonic,
+        aliased,
+      );
+    } else if (Math.abs(modulo - nyquist) < tolerance) {
+      addComplexComponent(
+        baseComponents,
+        nyquist,
+        2 * coefficient.re,
+        0,
+        harmonic,
+        aliased,
+      );
+    } else if (modulo < nyquist) {
+      addComplexComponent(
+        baseComponents,
+        modulo,
+        coefficient.re,
+        coefficient.im,
+        harmonic,
+        aliased,
+      );
+    } else {
+      addComplexComponent(
+        baseComponents,
+        holdSampleRate - modulo,
+        coefficient.re,
+        -coefficient.im,
+        harmonic,
+        aliased,
+      );
+    }
+  }
+
+  const addHeldLine = (frequency, component, imageIndex, side, special = false) => {
+    if (!(frequency >= minF && frequency <= maxF)) return;
+    const coefficientMagnitude = Math.hypot(component.re, component.im);
+    const basePeak = special ? coefficientMagnitude : 2 * coefficientMagnitude;
+    const heldPeak = basePeak * zohTF(frequency, holdSampleRate);
+    const isImage = imageIndex > 0;
+    const label = analyticalPeakLabel(component, isImage, imageIndex, side);
+    const typeName = isImage ? "zoh" : component.hasAlias ? "alias" : component.dominantHarmonic === 1 ? "fund" : "harm";
+    const color = typeName === "zoh" ? "#c084fc" : typeName === "alias" ? "#f87171" : typeName === "fund" ? "#60a5fa" : "#34d399";
+
+    if (showSaH) addLine(frequency, "S&H", heldPeak, label, typeName, color);
+    const outputPeak = heldPeak * (lpfOn ? lpfTF(frequency, lpfType, lpfCut) : 1);
+    addLine(frequency, "Ausgang", outputPeak, label, typeName, color);
+  };
+
+  for (const component of baseComponents.values()) {
+    const frequency = component.f;
+
+    if (frequency < 1e-8) {
+      addHeldLine(0, component, 0, "", true);
+      continue;
+    }
+
+    if (Math.abs(frequency - nyquist) < 1e-8) {
+      for (let image = 0; frequency + image * holdSampleRate <= maxF; image += 1) {
+        addHeldLine(frequency + image * holdSampleRate, component, image, "+", true);
+      }
+      continue;
+    }
+
+    addHeldLine(frequency, component, 0, "");
+
+    for (let image = 1; image * holdSampleRate - frequency <= maxF; image += 1) {
+      const lower = image * holdSampleRate - frequency;
+      const upper = image * holdSampleRate + frequency;
+      addHeldLine(lower, component, image, "−");
+      addHeldLine(upper, component, image, "+");
+    }
+  }
+
+  let components = Array.from(lines.values()).filter((line) =>
+    [line.Eingang, line["S&H"], line.Ausgang].some((value) => value != null),
+  );
+
+  const maxLines = 700;
+  if (components.length > maxLines) {
+    components = components
+      .sort((a, b) => {
+        const aLevel = Math.max(a.Eingang ?? -Infinity, a["S&H"] ?? -Infinity, a.Ausgang ?? -Infinity);
+        const bLevel = Math.max(b.Eingang ?? -Infinity, b["S&H"] ?? -Infinity, b.Ausgang ?? -Infinity);
+        return bLevel - aLevel;
+      })
+      .slice(0, maxLines);
+  }
+
+  components.sort((a, b) => a.f - b.f);
+
+  const rows = [];
+  const domainMin = scaleType === "log" ? Math.max(MIN_LOG_F, minF) : minF;
+  const domainSpan = Math.max(1, maxF - domainMin);
+
+  components.forEach((component, index) => {
+    const previous = components[index - 1]?.f ?? domainMin;
+    const next = components[index + 1]?.f ?? maxF;
+    const nominal = scaleType === "log"
+      ? Math.max(component.f * 0.0025, 0.02)
+      : Math.max(domainSpan / 5000, 0.05);
+    const leftGap = Math.max(0.001, component.f - previous);
+    const rightGap = Math.max(0.001, next - component.f);
+    const delta = Math.max(0.001, Math.min(nominal, leftGap / 3, rightGap / 3));
+    const left = Math.max(domainMin, component.f - delta);
+    const right = Math.min(maxF, component.f + delta);
+    const active = {
+      Eingang: component.Eingang != null,
+      "S&H": showSaH && component["S&H"] != null,
+      Ausgang: component.Ausgang != null,
+    };
+
+    rows.push({
+      f: left,
+      Eingang: active.Eingang ? SPECTRUM_FLOOR_DB : null,
+      "S&H": active["S&H"] ? SPECTRUM_FLOOR_DB : null,
+      Ausgang: active.Ausgang ? SPECTRUM_FLOOR_DB : null,
+    });
+    rows.push({
+      f: component.f,
+      Eingang: component.Eingang,
+      "S&H": showSaH ? component["S&H"] : null,
+      Ausgang: component.Ausgang,
+    });
+    rows.push({
+      f: right,
+      Eingang: active.Eingang ? SPECTRUM_FLOOR_DB : null,
+      "S&H": active["S&H"] ? SPECTRUM_FLOOR_DB : null,
+      Ausgang: active.Ausgang ? SPECTRUM_FLOOR_DB : null,
+    });
+    rows.push({
+      f: Math.min(maxF, right + Math.max(1e-6, delta * 0.05)),
+      Eingang: null,
+      "S&H": null,
+      Ausgang: null,
+    });
+  });
+
+  const peaks = components
+    .filter((component) => component.f > 1)
+    .map((component) => ({
+      f: component.f,
+      label: component.label,
+      type: component.type,
+      color: component.color,
+    }));
+
+  return { specComb: rows, pkList: peaks };
+}
+
 const MO = {
   fontFamily: "system-ui, -apple-system, BlinkMacSystemFont, \"Segoe UI\", sans-serif",
   fontVariantNumeric: "tabular-nums",
@@ -691,9 +980,10 @@ export default function SaHSimulator() {
   const [inPlay, setInPlay] = useState(false);
   const [outPlay, setOutPlay] = useState(false);
   const [showSaH, setShowSaH] = useState(true);
-  const [specMin, setSpecMin] = useState(0);
+  const [specMin, setSpecMin] = useState(MIN_LOG_F);
   const [specMax, setSpecMax] = useState(60_000);
-  const [specScale, setSpecScale] = useState("linear");
+  const [specScale, setSpecScale] = useState("log");
+  const [spectrumMode, setSpectrumMode] = useState("simplified");
 
   const audioCtxRef = useRef(null);
   const playersRef = useRef({ input: null, output: null });
@@ -830,16 +1120,52 @@ export default function SaHSimulator() {
   }, [tab, inSig, sahSig, outSig, freq, showSaH]);
 
   const spectrumMagnitudes = useMemo(() => {
-    if (tab !== "spec") return null;
+    if (tab !== "spec" || spectrumMode !== "fft") return null;
 
     return {
       input: computeSpectrum(inSig),
       sah: computeSpectrum(sahSig),
       output: computeSpectrum(outSig),
     };
-  }, [tab, inSig, sahSig, outSig]);
+  }, [tab, spectrumMode, inSig, sahSig, outSig]);
+
+  const simplifiedSpectrum = useMemo(() => {
+    if (tab !== "spec" || spectrumMode !== "simplified") return null;
+
+    return buildSimplifiedSpectrum({
+      type: wtype,
+      f0: freq,
+      amplitude: amp,
+      holdSampleRate: fs,
+      minF: specMin,
+      maxF: specMax,
+      scaleType: specScale,
+      showSaH,
+      lpfOn,
+      lpfType,
+      lpfCut,
+    });
+  }, [
+    tab,
+    spectrumMode,
+    wtype,
+    freq,
+    amp,
+    fs,
+    specMin,
+    specMax,
+    specScale,
+    showSaH,
+    lpfOn,
+    lpfType,
+    lpfCut,
+  ]);
 
   const { specComb, pkList } = useMemo(() => {
+    if (spectrumMode === "simplified") {
+      return simplifiedSpectrum || { specComb: [], pkList: [] };
+    }
+
     if (!spectrumMagnitudes) return { specComb: [], pkList: [] };
 
     const spectra = [
@@ -861,7 +1187,18 @@ export default function SaHSimulator() {
         (peak) => peak.f >= specMin,
       ),
     };
-  }, [spectrumMagnitudes, wtype, freq, fs, showSaH, specMin, specMax, specScale]);
+  }, [
+    spectrumMode,
+    simplifiedSpectrum,
+    spectrumMagnitudes,
+    wtype,
+    freq,
+    fs,
+    showSaH,
+    specMin,
+    specMax,
+    specScale,
+  ]);
 
   const tfData = useMemo(() => {
     if (tab !== "tf") return [];
@@ -1052,13 +1389,39 @@ export default function SaHSimulator() {
           </Panel>
 
           {tab === "spec" && (
-            <Panel title="FFT-Anzeige">
+            <Panel title="Spektrum">
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 12 }}>
+                <button
+                  type="button"
+                  onClick={() => setSpectrumMode("simplified")}
+                  style={{
+                    ...selectStyle,
+                    background: spectrumMode === "simplified" ? "var(--color-background-tertiary)" : "var(--color-background-secondary)",
+                    border: `1px solid ${spectrumMode === "simplified" ? "#60a5fa" : "var(--color-border-secondary)"}`,
+                    fontWeight: spectrumMode === "simplified" ? 700 : 500,
+                  }}
+                >
+                  Vereinfacht
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setSpectrumMode("fft")}
+                  style={{
+                    ...selectStyle,
+                    background: spectrumMode === "fft" ? "var(--color-background-tertiary)" : "var(--color-background-secondary)",
+                    border: `1px solid ${spectrumMode === "fft" ? "#60a5fa" : "var(--color-border-secondary)"}`,
+                    fontWeight: spectrumMode === "fft" ? 700 : 500,
+                  }}
+                >
+                  FFT
+                </button>
+              </div>
               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 12 }}>
                 <button
                   type="button"
                   onClick={() => {
                     setSpecScale("linear");
-                    if (specMin < 0) setSpecMin(0);
+                    setSpecMin(0);
                   }}
                   style={{
                     ...selectStyle,
@@ -1378,9 +1741,9 @@ export default function SaHSimulator() {
                         />
                       )}
 
-                      <Line isAnimationActive={false} type="linear" dataKey="Eingang" stroke="#60a5fa" dot={false} strokeWidth={1} strokeOpacity={0.8} />
-                      {showSaH && <Line isAnimationActive={false} type="linear" dataKey="S&H" stroke="#f97316" dot={false} strokeWidth={1} strokeOpacity={0.78} />}
-                      <Line isAnimationActive={false} type="linear" dataKey="Ausgang" stroke="#4ade80" dot={false} strokeWidth={1.8} />
+                      <Line isAnimationActive={false} connectNulls={false} type="linear" dataKey="Eingang" stroke="#60a5fa" dot={false} strokeWidth={1.2} strokeOpacity={0.85} />
+                      {showSaH && <Line isAnimationActive={false} connectNulls={false} type="linear" dataKey="S&H" stroke="#f97316" dot={false} strokeWidth={1.2} strokeOpacity={0.82} />}
+                      <Line isAnimationActive={false} connectNulls={false} type="linear" dataKey="Ausgang" stroke="#4ade80" dot={false} strokeWidth={1.8} />
                     </LineChart>
                   </ResponsiveContainer>
                 </div>
